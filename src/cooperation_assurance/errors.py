@@ -29,3 +29,22 @@ class InvalidState(ServiceError):
 class ValidationFailed(ServiceError):
     code = "validation_failed"
     status = 422
+
+
+class Unauthorized(ServiceError):
+    """凭据缺失、伪造或账号不可用。对调用方统一口径，详细原因只进授权审计。"""
+
+    code = "unauthorized"
+    status = 401
+
+
+class MissingCredentials(Unauthorized):
+    code = "missing_credentials"
+
+
+class TokenExpired(Unauthorized):
+    code = "token_expired"
+
+
+class TokenRevoked(Unauthorized):
+    code = "token_revoked"

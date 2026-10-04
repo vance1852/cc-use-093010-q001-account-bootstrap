@@ -39,3 +39,26 @@
     PYTHONPATH=src python3 -m metric_quality.api --database metric-quality.sqlite3 --host 127.0.0.1 --port 8082
 
 服务提供 JSON 接口与健康检查。进程重启后可以继续读取 SQLite 中的业务状态和审计历史。
+
+## 项目证据平台的身份与权限（cooperation_assurance）
+
+证据平台不接受任何可由调用方自填的身份头，账户与业务请求一律凭登录令牌：
+
+1. **首次管理员初始化（仅本地、仅一次）**：用 `--bootstrap-admin 编号:显示名称:口令`
+   在启动进程时建立首位管理员；不存在任何网络开户/引导路由，重复引导不会覆盖已有人员。
+   旧库（schema v2）中没有凭据与授权来源的账号在升级到 v3 后一律停用，并写入
+   `system:migration` 角色历史，须由管理员重新开户。
+2. **登录**：`POST /auth/login` 校验口令（PBKDF2-SHA256），返回服务端只存其哈希的
+   Bearer 令牌（8 小时有效）。错误口令、未知账号、已停用账号一律 401，且不产生会话。
+3. **日常开户 / 角色调整 / 停用**：`POST /accounts`、`POST /accounts/{id}/roles`、
+   `POST /accounts/{id}/deactivation` 都要求 administrator 有效令牌和授权理由；
+   管理员不持有评估决定权，开户与审批职责分离。角色调整与停用采用
+   `expected_role_version` 乐观版本守卫，同账号并发写由 `BEGIN IMMEDIATE` 串行化，
+   版本号严格递增、只有一个结论生效；停用会立即撤销该账号全部会话。
+4. **业务请求**：除 `/health`、`/bootstrap-status`、`/auth/login` 外，所有接口都要求
+   `Authorization: Bearer <令牌>`；缺失、伪造、过期、撤销的凭据一律先返回 401，
+   再谈请求体校验。
+5. **可复核**：`GET /accounts`、`GET /accounts/{id}`（含逐版本角色历史与授权者）和
+   `GET /authorization-events` 向具备审计权限的角色展示授权者、角色版本与每次拒绝的
+   原因码；所有身份与授权状态都持久化在 SQLite，重启后权限与历史保持一致。
+

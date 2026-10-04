@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,9 +33,56 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
-    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'administrator')),
+    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    password_salt TEXT,
+    password_hash TEXT,
+    created_by TEXT,
+    created_at TEXT,
+    updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS user_role_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    role_version INTEGER NOT NULL CHECK (role_version > 0),
+    role TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    change_type TEXT NOT NULL CHECK (change_type IN ('created', 'role_changed', 'deactivated')),
+    reason TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE (user_id, role_version)
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    issued_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    revoked_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS auth_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'admin.initialized', 'user.created', 'user.role_changed',
+        'user.deactivated', 'login.succeeded', 'login.denied',
+        'request.denied')),
+    user_id TEXT,
+    actor_id TEXT,
+    attempted_role TEXT,
+    role_version INTEGER,
+    permission TEXT,
+    result TEXT NOT NULL CHECK (result IN ('granted', 'denied')),
+    reason_code TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_auth_events_user ON auth_events(user_id, event_id);
 
 CREATE TABLE IF NOT EXISTS cooperation_programs (
     program_id TEXT PRIMARY KEY,
@@ -160,7 +207,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "cooperation_programs", "evidence_revisions", "batches",
+    "schema_meta", "protocol_catalog", "users", "user_role_history", "sessions", "auth_events",
+    "cooperation_programs", "evidence_revisions", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })
@@ -191,15 +239,96 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
 
 
 def initialize(connection: sqlite3.Connection) -> None:
-    """初始化基础资料表，重复执行不改变已有数据。"""
+    """初始化基础资料表，重复执行不改变已有数据，并完成旧版本迁移。"""
 
     connection.executescript(SCHEMA_SQL)
+    # v2 的 users 表没有身份/版本列且角色 CHECK 不含 administrator，需要重建。
+    user_columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(users)").fetchall()
+    }
+    legacy_users = bool(user_columns) and "role_version" not in user_columns
+
+    if legacy_users:
+        _rebuild_users_with_identity_columns(connection)
+        return
+
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
+
+
+def _rebuild_users_with_identity_columns(connection: sqlite3.Connection) -> None:
+    """按 SQLite 官方改表流程把旧 users 表替换为带身份字段的新表。
+
+    外键是按表名延迟解析的：关闭外键校验后 DROP 旧表再以 users 之名
+    重建，batches/sessions 等子表对 users(user_id) 的引用会自动指向新表，
+    不会残留 users_legacy 之类的悬空引用。
+    """
+
+    # PRAGMA foreign_keys 不允许在事务内改变，必须先关闭再开事务。
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE users_new (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'administrator')),
+                    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    password_salt TEXT,
+                    password_hash TEXT,
+                    created_by TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            # 旧账号没有凭据也没有授权来源：迁移后一律停用（active=0），
+            # 是否重新启用由首位管理员按开户流程处理。
+            connection.execute(
+                """
+                INSERT INTO users_new(user_id,display_name,role,role_version,active,
+                                      password_salt,password_hash,created_by,created_at,updated_at)
+                SELECT user_id,display_name,role,1,0,NULL,NULL,NULL,NULL,NULL FROM users
+                """
+            )
+            connection.execute("DROP TABLE users")
+            connection.execute("ALTER TABLE users_new RENAME TO users")
+            connection.execute(
+                """
+                INSERT INTO user_role_history(user_id,role_version,role,granted_by,change_type,reason,created_at)
+                SELECT u.user_id,1,u.role,'system:migration','created',
+                       'schema_v2 遗留账号缺少凭据与授权来源，迁移后保持停用',
+                       strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                FROM users u
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM user_role_history h
+                    WHERE h.user_id=u.user_id AND h.role_version=1
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise RuntimeError(f"迁移后存在外键不一致: {violations[:5]}")
 
 
 def inspect_schema(connection: sqlite3.Connection) -> dict[str, object]:
