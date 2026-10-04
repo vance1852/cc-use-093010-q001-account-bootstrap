@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,17 +24,19 @@ class Response:
 
 
 class JsonApplication:
-    """将 HTTP 路由映射到领域服务，便于无网络单元测试。"""
+    """将 HTTP 路由映射到领域服务，便于无网络单元测试。
+
+    除健康检查、首次管理员初始化和登录外，所有接口都要求
+    Authorization: Bearer <token>；不再接受自报身份。
+    """
 
     def __init__(self, service: AssuranceService) -> None:
         self.service = service
+        self._lock = threading.RLock()
 
-    @staticmethod
-    def _actor(headers: Mapping[str, str]) -> str:
-        actor = headers.get("x-actor-id", "").strip()
-        if not actor:
-            raise ValidationFailed("缺少 X-Actor-Id")
-        return actor
+    def _principal(self, headers: Mapping[str, str]) -> str:
+        token = headers.get("authorization", "").removeprefix("Bearer ").strip()
+        return self.service.authenticate(token)["user_id"]
 
     @staticmethod
     def _json(body: bytes) -> dict[str, Any]:
@@ -50,6 +53,13 @@ class JsonApplication:
     def handle(
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
+        # 串行化分发：同一账号的并发请求在单连接上形成唯一结论。
+        with self._lock:
+            return self._dispatch(method, target, headers, body)
+
+    def _dispatch(
+        self, method: str, target: str, headers: Mapping[str, str] | None, body: bytes
+    ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
         path = urlparse(target).path.rstrip("/") or "/"
         parts = [part for part in path.split("/") if part]
@@ -57,70 +67,85 @@ class JsonApplication:
             if method == "GET" and path == "/health":
                 return Response(200, {"status": "ok"})
             payload = self._json(body) if method in {"POST", "PUT", "PATCH"} else {}
-            if method == "POST" and path == "/users":
-                result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
+            # 身份建立链路：首次初始化与登录不需要既有凭据。
+            if method == "POST" and path == "/users/bootstrap":
+                result = self.service.bootstrap_admin(
+                    payload["user_id"], payload["display_name"], payload["password"]
+                )
                 return Response(201, result)
+            if method == "POST" and path == "/session":
+                return Response(200, self.service.login(payload["user_id"], payload["password"]))
+            if method == "POST" and path == "/users":
+                result = self.service.create_user(
+                    self._principal(normalized_headers),
+                    payload["user_id"], payload["display_name"], payload["role"], payload["password"],
+                )
+                return Response(201, result)
+            if method == "GET" and path == "/users":
+                return Response(200, {"users": self.service.user_directory(self._principal(normalized_headers))})
+            if method == "GET" and len(parts) == 2 and parts[0] == "users":
+                return Response(200, self.service.user_detail(self._principal(normalized_headers), parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "role":
+                result = self.service.change_role(
+                    self._principal(normalized_headers), parts[1], payload["role"],
+                    int(payload["expected_role_version"]),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "password":
+                return Response(200, self.service.reset_password(self._principal(normalized_headers), parts[1], payload["password"]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "deactivate":
+                return Response(200, self.service.deactivate_user(self._principal(normalized_headers), parts[1]))
+            if method == "GET" and path == "/audit/access":
+                return Response(200, {"events": self.service.access_audit(self._principal(normalized_headers))})
+            # 业务链路：一律要求已认证主体。
+            actor = self._principal(normalized_headers)
             if method == "POST" and path == "/cooperation_programs":
                 result = self.service.register_program(
-                    self._actor(normalized_headers), payload["program_id"], payload["program_name"], payload["lead_organization"]
+                    actor, payload["program_id"], payload["program_name"], payload["lead_organization"]
                 )
                 return Response(201, result)
             if method == "POST" and path == "/evidence_revisions":
                 result = self.service.register_evidence_revision(
-                    self._actor(normalized_headers), payload["evidence_revision_id"], payload["program_id"],
+                    actor, payload["evidence_revision_id"], payload["program_id"],
                     payload["version"], payload["content_sha256"],
                 )
                 return Response(201, result)
             if method == "POST" and path == "/protocols":
-                return Response(201, self.service.publish_protocol(self._actor(normalized_headers), payload))
+                return Response(201, self.service.publish_protocol(actor, payload))
             if method == "POST" and path == "/batches":
                 result = self.service.create_batch(
-                    self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
+                    actor, payload["batch_id"], payload["protocol_id"],
                     int(payload["protocol_version"]), payload["evidence_revision_id"],
                 )
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "start":
-                result = self.service.start_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.start_batch(actor, parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "observations":
                 key = normalized_headers.get("idempotency-key", "").strip()
                 if not key:
                     raise ValidationFailed("缺少 Idempotency-Key")
-                result = self.service.import_observations(
-                    self._actor(normalized_headers), parts[1], key, payload.get("observations", [])
-                )
+                result = self.service.import_observations(actor, parts[1], key, payload.get("observations", []))
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "seal":
-                result = self.service.seal_batch(
-                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
-                )
+                result = self.service.seal_batch(actor, parts[1], int(payload["expected_revision"]))
                 return Response(200, result)
             if method == "GET" and len(parts) == 3 and parts[0] == "batches" and parts[2] == "report":
-                return Response(200, self.service.report(self._actor(normalized_headers), parts[1]))
+                return Response(200, self.service.report(actor, parts[1]))
             if method == "POST" and path == "/exclusions":
-                result = self.service.request_exclusion(
-                    self._actor(normalized_headers), int(payload["observation_id"]), payload["reason"]
-                )
+                result = self.service.request_exclusion(actor, int(payload["observation_id"]), payload["reason"])
                 return Response(201, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "review":
-                result = self.service.review_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), bool(payload["approve"]), payload.get("note", "")
-                )
+                result = self.service.review_exclusion(actor, int(parts[1]), bool(payload["approve"]), payload.get("note", ""))
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "exclusions" and parts[2] == "revoke":
-                result = self.service.revoke_exclusion(
-                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
-                )
+                result = self.service.revoke_exclusion(actor, int(parts[1]), payload["reason"])
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
                 result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
                 return Response(200, {"job": result})
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
-                result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
-                )
+                result = self.service.complete_job(payload["worker_id"], int(parts[1]), actor)
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
@@ -129,7 +154,7 @@ class JsonApplication:
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
-                    self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),
+                    actor, payload["batch_id"], int(payload["analysis_id"]),
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)

@@ -39,3 +39,14 @@
     PYTHONPATH=src python3 -m metric_quality.api --database metric-quality.sqlite3 --host 127.0.0.1 --port 8082
 
 服务提供 JSON 接口与健康检查。进程重启后可以继续读取 SQLite 中的业务状态和审计历史。
+
+## 身份与权限（项目证据平台）
+
+`cooperation_assurance` 的开户与评估接口一律要求已认证身份，不再接受自报身份：
+
+- `POST /users/bootstrap`：首次初始化管理员，仅当没有在管管理员时可用；重复初始化不会覆盖已有人员；
+- `POST /session`：口令登录，返回 8 小时有效的 Bearer 会话令牌；
+- `POST /users`、`POST /users/{id}/role`、`POST /users/{id}/password`、`POST /users/{id}/deactivate`：日常开户、角色调整、口令重置与停用，仅管理员可用；角色调整需携带当前 `role_version`，版本冲突返回 409；
+- `GET /users`、`GET /users/{id}`：账号目录，展示授权者（`authorized_by`）与角色版本（`role_version`），管理员与审计员可读；
+- `GET /audit/access`：身份链审计，包含开户、角色调整、停用与全部访问拒绝原因，管理员与审计员可读；
+- 其余业务接口一律要求 `Authorization: Bearer <token>`，缺失、过期或伪造的凭据返回 401 并记入审计。

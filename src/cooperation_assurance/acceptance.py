@@ -25,10 +25,11 @@ def run(workspace: Path) -> dict[str, object]:
         connection = connect(database)
         try:
             service = AssuranceService(connection)
-            service.create_user("operator-1", "测试操作员", "operator")
-            service.create_user("stat-1", "统计负责人", "statistician")
-            service.create_user("approver-1", "分析准入审批人", "approver")
-            service.create_user("auditor-1", "审计人员", "auditor")
+            service.bootstrap_admin("admin-1", "初始化管理员", "admin-pass-0001")
+            service.create_user("admin-1", "operator-1", "测试操作员", "operator", "operator-pass-1")
+            service.create_user("admin-1", "stat-1", "统计负责人", "statistician", "stat-pass-0001")
+            service.create_user("admin-1", "approver-1", "分析准入审批人", "approver", "approver-pass-1")
+            service.create_user("admin-1", "auditor-1", "审计人员", "auditor", "auditor-pass-01")
             service.register_program("operator-1", "program-a", "跨境数据服务合作项目", "示例牵头机构")
             service.register_evidence_revision("operator-1", "evidence_revision-a1", "program-a", "1.0.0", "a" * 64)
             service.publish_protocol("stat-1", protocol)
@@ -50,8 +51,20 @@ def run(workspace: Path) -> dict[str, object]:
             schema = inspect_schema(connection)
         finally:
             connection.close()
-    if schema["missing_tables"] or schema["schema_version"] != "2":
+        # 模拟服务重启：重新打开同一数据库，权限状态与身份链历史必须保持一致。
+        restarted = connect(database)
+        try:
+            restored = AssuranceService(restarted)
+            session = restored.login("auditor-1", "auditor-pass-01")
+            principal = restored.authenticate(session["token"])
+            directory = restored.user_directory("admin-1")
+            identity_events = restored.access_audit("auditor-1")
+        finally:
+            restarted.close()
+    if schema["missing_tables"] or schema["schema_version"] != "3":
         raise RuntimeError("SQLite 基础结构检查失败")
+    if principal["user_id"] != "auditor-1" or len(directory) != 5 or not identity_events:
+        raise RuntimeError("重启后权限状态与身份链历史不一致")
     return {
         "status": "ok",
         "protocol": f"{protocol['protocol_id']}@{protocol['version']}",
@@ -61,6 +74,8 @@ def run(workspace: Path) -> dict[str, object]:
         "conclusion": analysis["result"]["conclusion"],
         "decision": report["decision"]["decision"],
         "event_count": len(report["events"]),
+        "user_count": len(directory),
+        "identity_event_count": len(identity_events),
         "schema": schema,
     }
 

@@ -6,6 +6,11 @@ class ServiceError(RuntimeError):
     status = 400
 
 
+class Unauthorized(ServiceError):
+    code = "unauthorized"
+    status = 401
+
+
 class NotFound(ServiceError):
     code = "not_found"
     status = 404

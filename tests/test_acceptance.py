@@ -18,6 +18,8 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(result["conclusion"], "pass")
         self.assertEqual(result["decision"], "approved")
         self.assertEqual(len(result["input_sha256"]), 64)
+        self.assertEqual(result["user_count"], 5)
+        self.assertGreaterEqual(result["identity_event_count"], 5)
 
 
 if __name__ == "__main__":

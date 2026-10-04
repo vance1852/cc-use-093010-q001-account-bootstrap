@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -33,7 +33,26 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
-    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
+    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+    authorized_by TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS user_credentials (
+    user_id TEXT PRIMARY KEY REFERENCES users(user_id),
+    salt TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
 );
 
@@ -160,7 +179,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "cooperation_programs", "evidence_revisions", "batches",
+    "schema_meta", "protocol_catalog", "users", "user_credentials", "auth_sessions",
+    "cooperation_programs", "evidence_revisions", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })
@@ -169,7 +189,7 @@ REQUIRED_TABLES = frozenset({
 def connect(path: str | Path) -> sqlite3.Connection:
     """打开连接并启用严格的事务与外键设置。"""
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -190,10 +210,47 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate_users_v3(connection: sqlite3.Connection) -> None:
+    """把 v2 的 users 表重建为 v3：新增角色版本、授权来源和时间戳，并放开 admin 角色。
+
+    已有人员逐行保留，角色版本从 1 开始，授权来源留空（历史数据无法追溯授权者）。
+    迁移后旧账号没有登录凭据，需要管理员重置口令后才能登录。
+    """
+
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)")}
+    if "role_version" in columns:
+        return
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys = OFF")
+    try:
+        with transaction(connection, immediate=True):
+            connection.execute(
+                """CREATE TABLE users_v3 (
+                    user_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor', 'admin')),
+                    active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+                    role_version INTEGER NOT NULL DEFAULT 1 CHECK (role_version > 0),
+                    authorized_by TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
+            connection.execute(
+                """INSERT INTO users_v3(user_id, display_name, role, active, role_version, authorized_by, created_at, updated_at)
+                   SELECT user_id, display_name, role, active, 1, NULL, '', '' FROM users"""
+            )
+            connection.execute("DROP TABLE users")
+            connection.execute("ALTER TABLE users_v3 RENAME TO users")
+    finally:
+        connection.execute(f"PRAGMA foreign_keys = {'ON' if foreign_keys else 'OFF'}")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate_users_v3(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
